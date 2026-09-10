@@ -30,11 +30,12 @@ FINALIZED = os.path.join(STAGING_ROOT, "finalized")
 OVERLAY_INIT = Path(os.path.join(BASEDIR, ".overlay_init"))
 
 # do not allow to engage after this many hours onroad and this many routes
+# fork: routes raised from upstream's 84/80, the device doesn't always reach wifi between drives
 HOURS_NO_CONNECTIVITY_MAX = 27
-ROUTES_NO_CONNECTIVITY_MAX = 84
+ROUTES_NO_CONNECTIVITY_MAX = 500
 # send an offroad prompt after this many hours onroad and this many routes
 HOURS_NO_CONNECTIVITY_PROMPT = 23
-ROUTES_NO_CONNECTIVITY_PROMPT = 80
+ROUTES_NO_CONNECTIVITY_PROMPT = 480
 
 
 class UserRequest:

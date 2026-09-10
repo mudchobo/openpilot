@@ -65,6 +65,17 @@ class TorqueSettingsLayout(Widget):
       description=lambda: tr("Less strict settings when using Self-Tune. This allows torqued to be more " +
                              "forgiving when learning values."),
     )
+    self._friction_reduction = option_item_sp(
+      title=lambda: tr("Friction Reduction"),
+      param="FrictionReduction",
+      description=lambda: tr("Reduces the friction the torque controller uses, which can help with weaving " +
+                             "at low speed. Each step lowers it by 10%. Adjustable while driving; takes " +
+                             "effect within a few seconds."),
+      min_value=0,
+      max_value=9,
+      value_change_step=1,
+      label_callback=(lambda x: tr("Off") if x == 0 else f"-{x * 10}%"),
+    )
     self._custom_tune_toggle = toggle_item_sp(
       param="CustomTorqueParams",
       title=lambda: tr("Enable Custom Tuning"),
@@ -106,6 +117,7 @@ class TorqueSettingsLayout(Widget):
       self._torque_control_versions,
       self._self_tune_toggle,
       self._relaxed_tune_toggle,
+      self._friction_reduction,
       self._custom_tune_toggle,
       self._torque_prams_override_toggle,
       self._torque_lat_accel_factor,
@@ -122,6 +134,8 @@ class TorqueSettingsLayout(Widget):
       self._relaxed_tune_toggle.action_item.set_state(False)
     self._self_tune_toggle.action_item.set_enabled(ui_state.is_offroad())
     self._relaxed_tune_toggle.action_item.set_enabled(ui_state.is_offroad() and self._self_tune_toggle.action_item.get_state())
+    # hidden while Manual Real-Time Tuning owns the friction value; stays enabled onroad by design
+    self._friction_reduction.set_visible(not self._torque_prams_override_toggle.action_item.get_state())
     self._custom_tune_toggle.action_item.set_enabled(ui_state.is_offroad())
     custom_tune_enabled = self._custom_tune_toggle.action_item.get_state()
     self._torque_prams_override_toggle.set_visible(custom_tune_enabled)

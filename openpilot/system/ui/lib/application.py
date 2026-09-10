@@ -130,11 +130,53 @@ class TextAlignmentVertical(IntEnum):
   BOTTOM = 2
 
 
-def font_fallback(font: rl.Font) -> rl.Font:
-  """Use a Noto fallback for languages not covered by Inter."""
+# Korean uses the Kakao Sans families (SIL Open Font License 1.1) instead of Noto, with a real
+# weight for each FontWeight. Kakao Small Sans is drawn for body text and Kakao Big Sans, which is
+# designed to stay legible at a glance, for the bold weights and the large onroad readouts.
+# MEDIUM/DISPLAY/ROMAN share a file with another weight, so they are aliases of it here.
+# UNIFONT is deliberately absent: it carries the language names in the language picker, which
+# no single Korean font covers, so it keeps rendering with unifont.
+KOREAN_FONTS = {
+  FontWeight.NORMAL: "KakaoSmallSans-Regular.otf",
+  FontWeight.DISPLAY_REGULAR: "KakaoSmallSans-Regular.otf",
+  FontWeight.SEMI_BOLD: "KakaoSmallSans-Bold.otf",
+  FontWeight.BOLD: "KakaoBigSans-Bold.otf",
+  FontWeight.AUDIOWIDE: "KakaoBigSans-Bold.otf",
+}
+
+# Rasterized size of the fallback atlas. Inter is baked at 200 and the biggest text we draw is
+# ~200px, so the default 48 is a heavy upscale. Korean is worth the extra memory; measured atlas
+# sizes for its 379 codepoints are 1024x1024 (2MB) at 48, 2048x2048 (8MB) at 120, 4096x4096 (34MB)
+# at 200. Lower this first if the fallback atlases ever become a problem.
+FALLBACK_FONT_SIZE = 48
+KOREAN_FONT_SIZE = 120
+
+# The fallback atlas only bakes what the translation file uses, so text that doesn't come from a
+# translation (road names, Wi-Fi SSIDs) has no glyphs and draws as '?'. Those characters are
+# learned as they are drawn and folded into the atlas on the next frame. Rebuilding costs one
+# font load, measured at 9-30ms, so it is a single dropped frame the first time a character shows
+# up. The cap keeps a pathological source of text from growing the atlas without bound.
+MAX_LEARNED_FALLBACK_CHARS = 2000
+MAX_SCANNED_TEXTS = 4096
+
+
+def fallback_font_file(language: str, font_weight: FontWeight) -> str:
+  if language == "ko":
+    return KOREAN_FONTS.get(font_weight, KOREAN_FONTS[FontWeight.NORMAL])
+  return NOTO_FONTS[language]
+
+
+def font_fallback(font: rl.Font, text: str | None = None) -> rl.Font:
+  """Use a Noto or Kakao fallback for languages not covered by Inter."""
   if multilang.requires_font_fallback():
-    return gui_app.fallback_font()
+    if text is not None:
+      gui_app.note_fallback_text(text)
+    return gui_app.fallback_font(font)
   return font
+
+
+def keeps_own_font(language: str, font_weight: FontWeight) -> bool:
+  return language == "ko" and font_weight not in KOREAN_FONTS
 
 
 class MousePos(NamedTuple):
@@ -221,7 +263,14 @@ class GuiApplication(GuiApplicationExt):
     self._set_log_callback()
 
     self._fonts: dict[FontWeight, rl.Font] = {}
-    self._fallback_fonts: dict[str, rl.Font] = {}
+    self._fallback_fonts: dict[tuple[str, FontWeight], rl.Font] = {}
+    # texture id -> weight, to recover which weight a caller asked for (see fallback_font)
+    self._font_weights: dict[int, FontWeight] = {}
+    # all keyed by language: coverage is per language, so the bookkeeping has to be too
+    self._fallback_chars: dict[str, set[str]] = {}   # characters in the language's atlas
+    self._learned_chars: dict[str, set[str]] = {}    # characters learned at runtime
+    self._pending_chars: dict[str, set[str]] = {}    # seen but not baked yet
+    self._scanned_texts: dict[str, set[str]] = {}
     self._width = width if width is not None else GuiApplication._default_width()
     self._height = height if height is not None else GuiApplication._default_height()
 
@@ -578,9 +627,18 @@ class GuiApplication(GuiApplicationExt):
     for font in self._fonts.values():
       rl.unload_font(font)
     self._fonts = {}
+    self._font_weights = {}
+    # several weights can share one loaded fallback atlas, so unload each of them only once
+    unloaded: set[int] = set()
     for font in self._fallback_fonts.values():
-      rl.unload_font(font)
+      if font.texture.id not in unloaded:
+        unloaded.add(font.texture.id)
+        rl.unload_font(font)
     self._fallback_fonts = {}
+    self._fallback_chars = {}
+    self._learned_chars = {}
+    self._pending_chars = {}
+    self._scanned_texts = {}
 
     if self._render_texture is not None:
       rl.unload_render_texture(self._render_texture)
@@ -632,6 +690,10 @@ class GuiApplication(GuiApplicationExt):
           time.sleep(1 / self._target_fps)
           yield False, 0.0, 0.0
           continue
+
+        # bake newly seen characters before drawing, never in the middle of a frame
+        if self._pending_chars.get(multilang.language):
+          self.grow_fallback_fonts()
 
         if self._render_texture:
           rl.begin_texture_mode(self._render_texture)
@@ -706,20 +768,95 @@ class GuiApplication(GuiApplicationExt):
   def font(self, font_weight: FontWeight = FontWeight.NORMAL) -> rl.Font:
     return self._fonts[font_weight]
 
-  def fallback_font(self) -> rl.Font:
+  def fallback_font(self, font: "rl.Font | None" = None) -> rl.Font:
+    """Fallback font matching the weight the caller asked for.
+
+    Every draw goes through font_fallback() with an already resolved rl.Font, so the requested
+    weight is recovered from the font's texture id.
+    """
     language = multilang.language
-    if language not in self._fallback_fonts:
+    font_weight = FontWeight.NORMAL if font is None else self._font_weights.get(font.texture.id, FontWeight.NORMAL)
+    if font is not None and keeps_own_font(language, font_weight):
+      return font
+    return self._fallback_font_for(language, font_weight)
+
+  def _fallback_font_for(self, language: str, font_weight: FontWeight) -> rl.Font:
+    """Atlases are built on first use, and weights mapped to the same file share one."""
+    key = (language, font_weight)
+    if key not in self._fallback_fonts:
+      font_file = fallback_font_file(language, font_weight)
+      shared = next((f for (lang, weight), f in self._fallback_fonts.items()
+                     if lang == language and fallback_font_file(lang, weight) == font_file), None)
+      self._fallback_fonts[key] = shared if shared is not None else self._load_fallback_font(language, font_weight)
+    return self._fallback_fonts[key]
+
+  def _fallback_characters(self, language: str) -> set[str]:
+    chars = self._fallback_chars.get(language)
+    if chars is None:
       chars = set(map(chr, range(32, 127))) | set(EXTRA_FONT_CHARS)
       chars.update(TRANSLATIONS_DIR.joinpath(f"app_{language}.po").read_text(encoding="utf-8"))
-      codepoints = sorted(map(ord, chars))
-      codepoint_buffer = rl.ffi.new("int[]", codepoints)
-      with as_file(FONT_DIR) as fspath:
-        font = rl.load_font_ex((fspath / NOTO_FONTS[language]).as_posix(), 48,
-                               rl.ffi.cast("int *", codepoint_buffer), len(codepoints))
-      rl.gen_texture_mipmaps(font.texture)
-      rl.set_texture_filter(font.texture, rl.TextureFilter.TEXTURE_FILTER_TRILINEAR)
-      self._fallback_fonts[language] = font
-    return self._fallback_fonts[language]
+      chars |= self._learned_chars.get(language, set())
+      self._fallback_chars[language] = chars
+    return chars
+
+  def _load_fallback_font(self, language: str, font_weight: FontWeight) -> rl.Font:
+    codepoints = sorted(map(ord, self._fallback_characters(language)))
+    codepoint_buffer = rl.ffi.new("int[]", codepoints)
+    size = KOREAN_FONT_SIZE if language == "ko" else FALLBACK_FONT_SIZE
+    with as_file(FONT_DIR) as fspath:
+      font = rl.load_font_ex((fspath / fallback_font_file(language, font_weight)).as_posix(), size,
+                             rl.ffi.cast("int *", codepoint_buffer), len(codepoints))
+    rl.gen_texture_mipmaps(font.texture)
+    rl.set_texture_filter(font.texture, rl.TextureFilter.TEXTURE_FILTER_TRILINEAR)
+    return font
+
+  def note_fallback_text(self, text: str) -> None:
+    """Remember characters the fallback atlas has no glyph for, so the next frame can bake them.
+
+    Called for every string drawn or measured while a fallback language is active, so the ASCII
+    fast path matters: str.isascii() is a flag lookup on the string object, and the rest is only
+    reached by text that actually carries non-ASCII characters.
+    """
+    if not isinstance(text, str) or text.isascii():
+      return
+
+    language = multilang.language
+    scanned = self._scanned_texts.setdefault(language, set())
+    if text in scanned or len(self._learned_chars.get(language, ())) >= MAX_LEARNED_FALLBACK_CHARS:
+      return
+
+    if len(scanned) >= MAX_SCANNED_TEXTS:
+      scanned.clear()
+    scanned.add(text)
+
+    missing = set(text) - self._fallback_characters(language)
+    if missing:
+      self._pending_chars.setdefault(language, set()).update(missing)
+
+  def grow_fallback_fonts(self) -> None:
+    """Fold the characters seen since the last frame into the fallback atlases."""
+    language = multilang.language
+    pending = self._pending_chars.pop(language, set())
+    self._pending_chars.clear()  # anything left is from a language we are no longer showing
+
+    learned = self._learned_chars.setdefault(language, set())
+    room = MAX_LEARNED_FALLBACK_CHARS - len(learned)
+    added = set(sorted(pending)[:room]) - learned if room > 0 else set()
+    if not added:
+      return
+
+    learned |= added
+    self._fallback_chars.pop(language, None)
+
+    stale = [key for key in self._fallback_fonts if key[0] == language]
+    unloaded: set[int] = set()
+    for key in stale:
+      font = self._fallback_fonts.pop(key)
+      if font.texture.id not in unloaded:
+        unloaded.add(font.texture.id)
+        rl.unload_font(font)
+    for key in stale:
+      self._fallback_font_for(*key)
 
   @property
   def width(self):
@@ -748,6 +885,7 @@ class GuiApplication(GuiApplicationExt):
           rl.gen_texture_mipmaps(font.texture)
           rl.set_texture_filter(font.texture, rl.TextureFilter.TEXTURE_FILTER_TRILINEAR)
         self._fonts[font_weight_file] = font
+        self._font_weights[font.texture.id] = font_weight_file
     if multilang.requires_font_fallback():
       self.fallback_font()
 
@@ -757,7 +895,7 @@ class GuiApplication(GuiApplicationExt):
       rl._orig_draw_text_ex = rl.draw_text_ex
 
     def _draw_text_ex_scaled(font, text, position, font_size, spacing, tint):
-      font = font_fallback(font)
+      font = font_fallback(font, text)
       return rl._orig_draw_text_ex(font, text, position, font_size * FONT_SCALE, spacing, tint)
 
     rl.draw_text_ex = _draw_text_ex_scaled

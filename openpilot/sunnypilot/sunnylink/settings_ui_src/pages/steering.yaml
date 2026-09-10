@@ -157,6 +157,17 @@ sections:
       - type: param
         key: LiveTorqueParamsToggle
         equals: true
+    - key: FrictionReduction
+      widget: option
+      title: Friction Reduction
+      description: Reduces the friction the torque controller uses, which can help with weaving at low speed. Each step
+        lowers it by 10%. Adjustable while driving; takes effect within a few seconds.
+      min_value: 0
+      max_value: 9
+      visibility:
+      - type: param
+        key: TorqueParamsOverrideEnabled
+        equals: false
     - key: CustomTorqueParams
       widget: toggle
       title: Enable Custom Tuning
